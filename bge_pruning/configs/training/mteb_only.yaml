@@ -1,0 +1,22 @@
+model:
+  use_sts_loss: false
+  use_contrastive_loss: true
+
+train_loader:
+  name: mteb
+  dataset:
+    mteb_path: "data/mteb/train.jsonl"
+  batch_size: 32
+  num_workers: 4
+
+eval_loader:
+  name: mteb
+  dataset:
+    mteb_path: "data/mteb/dev.jsonl"
+  batch_size: 64
+  num_workers: 2
+
+callbacks:
+  - name: "evaluation_callback"
+
+run_name: "mteb_only_training"

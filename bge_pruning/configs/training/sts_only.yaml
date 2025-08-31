@@ -1,0 +1,22 @@
+model:
+  use_sts_loss: true
+  use_contrastive_loss: false
+
+train_loader:
+  name: sts
+  dataset:
+    sts_path: "data/sts/train.tsv"
+  batch_size: 32
+  num_workers: 4
+
+eval_loader:
+  name: sts
+  dataset:
+    sts_path: "data/sts/dev.tsv"
+  batch_size: 64
+  num_workers: 2
+
+callbacks:
+  - name: "embedding_callback"
+
+run_name: "sts_only_training"

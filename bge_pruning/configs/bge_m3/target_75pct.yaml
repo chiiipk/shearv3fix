@@ -1,0 +1,42 @@
+# Production BGE-M3 Pruning Configuration
+# Focused on head/layer/intermediate pruning with MTEB support
+
+model:
+  base_model: "BAAI/bge-m3"
+  use_sts_loss: true
+  use_contrastive_loss: true
+  temperature: 0.07
+  
+  l0_module:
+    # Production pruning: head, layer, intermediate only
+    pruning_modules: ["layer", "head", "intermediate"]
+    start_sparsity: 0.0
+    lagrangian_warmup_steps: "1000ba"
+    eval_target_model: true
+    
+    # Target architecture for 75% reduction (aggressive pruning)
+    target_model:
+      n_layers: 6   # From 24 (75% reduction)
+      n_heads: 4    # From 16 (75% reduction)
+      intermediate_size: 1024  # From 4096 (75% reduction)
+
+optimizer:
+  # Stable learning rates for production
+  lr: 7.0e-6
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.01
+
+# Training settings
+batch_size: 16
+max_length: 512
+max_duration: "10000ba"
+eval_interval: "500ba"
+save_interval: "1000ba"
+save_folder: "experiments/production_75pct"
+seed: 42
+device: gpu
+precision: "amp_bf16"
+
+# HuggingFace model export (automatic after training)
+# Saves to: {save_folder}_hf/

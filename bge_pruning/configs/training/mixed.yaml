@@ -1,0 +1,27 @@
+model:
+  use_sts_loss: true
+  use_contrastive_loss: true
+
+train_loader:
+  name: mixed
+  dataset:
+    sts_path: "data/sts/train.tsv"
+    mteb_path: "data/mteb/train.jsonl"
+    sts_ratio: 0.6  # Slightly favor STS
+  batch_size: 32
+  num_workers: 4
+
+eval_loader:
+  name: mixed
+  dataset:
+    sts_path: "data/sts/dev.tsv"
+    mteb_path: "data/mteb/dev.jsonl"
+    sts_ratio: 0.5
+  batch_size: 64
+  num_workers: 2
+
+callbacks:
+  - name: "embedding_callback"
+  - name: "evaluation_callback"
+
+run_name: "mixed_training"

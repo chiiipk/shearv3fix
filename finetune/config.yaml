@@ -1,0 +1,50 @@
+# Configuration for finetuning pruned BGE-M3 on STS dataset
+
+# Model settings  
+model_path: "../bge_pruning/experiments_1nua/production_hf"  # Path to pruned model directory
+temperature: 0.02
+
+# Training settings
+batch_size: 16
+epochs: 10
+learning_rate: 2e-5
+max_length: 512
+weight_decay: 0.01
+
+# Layer unfreezing strategy
+# -1: unfreeze all layers (full finetuning)
+#  0: freeze all backbone layers (only train embedding head)
+#  N: unfreeze last N layers
+unfreeze_layers: 2
+
+# Data settings (automatically loaded from HuggingFace)
+dataset: "glue"
+subset: "stsb"
+# Splits: train, validation, test
+
+# Training configuration
+save_dir: "checkpoints"
+device: "auto"  # auto, cuda, cpu
+num_workers: 2
+pin_memory: true
+
+# Optimizer settings
+optimizer:
+  name: "adamw"
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  
+# Scheduler settings (optional)
+scheduler:
+  name: "cosine"
+  warmup_steps: 100
+  
+# Evaluation settings
+eval_steps: 500  # Evaluate every N steps
+save_steps: 1000  # Save checkpoint every N steps
+logging_steps: 100  # Log metrics every N steps
+
+# Early stopping
+early_stopping:
+  patience: 3
+  min_delta: 0.001

@@ -1,0 +1,7 @@
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.12.0
+mosaicml>=0.17.0
+omegaconf>=2.3.0
+scipy
+safetensors>=0.3.0
