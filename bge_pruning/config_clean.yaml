@@ -28,11 +28,11 @@ optimizer:
   weight_decay: 0.01
 
 # Training settings
-batch_size: 16
-max_length: 512
+batch_size: 4
+max_length: 256
 max_duration: "10000ba"
 eval_interval: "500ba"
-save_interval: "1000ba"
+save_interval: "5000ba"
 save_folder: "experiments/production"
 seed: 42
 device: gpu
