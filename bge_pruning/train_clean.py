@@ -26,10 +26,12 @@ from callbacks.pruning_callback import PruningCallback
 
 def get_num_samples_in_batch(batch):
     """Get actual batch size from interleaved tensor pairs"""
+    #mỗi mẫu samples là 1 cặp queries + documents nên phải chia 2 để ra số batch, batch sẽ có dạng q1,d1,q2,d2
     return batch['input_ids'].size(0) // 2
 
 def split_batch(batch, microbatch_size):
     """Custom batch splitting for interleaved sentence pairs"""
+    #đầu vào là batch, microbatch_size (lấy từ đâu?)
     if microbatch_size is None:
         return [batch]
     
