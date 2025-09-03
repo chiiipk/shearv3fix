@@ -16,6 +16,27 @@ from .embedding_heads import BGEEmbeddingHeads
 from .bge_m3_backbone import MaskedBGEM3Backbone
 
 
+# =========================
+# [VOCAB_SYNC] Utilities
+# =========================
+def _safe_get_tokenizer_vocab_size(tokenizer) -> int:
+    """Ưu tiên len(tokenizer) (bao gồm added tokens), fallback tokenizer.vocab_size."""
+    size_by_len = None
+    try:
+        size_by_len = len(tokenizer)
+    except Exception:
+        pass
+    size_by_attr = getattr(tokenizer, "vocab_size", None)
+    candidates = [s for s in [size_by_len, size_by_attr] if isinstance(s, int) and s > 0]
+    if not candidates:
+        # fallback cuối cùng
+        get_vocab = getattr(tokenizer, "get_vocab", None)
+        if callable(get_vocab):
+            return len(get_vocab())
+        raise ValueError("Cannot determine tokenizer vocab size.")
+    return max(candidates)
+
+
 class ComposerBGEM3(ComposerModel):
     """BGE-M3 model with L0 pruning and Composer interface"""
 
@@ -28,10 +49,6 @@ class ComposerBGEM3(ComposerModel):
         base_model = AutoModel.from_pretrained(model_name)
         self.config = base_model.config
 
-        # === Backbone ===
-        self.backbone = MaskedBGEM3Backbone(self.config)
-        self.backbone.load_state_dict(base_model.state_dict(), strict=False)
-
         # === Optional overrides from cfg (keep consistent with math constraints) ===
         if hasattr(cfg, 'd_model'):
             self.config.hidden_size = cfg.d_model
@@ -40,21 +57,55 @@ class ComposerBGEM3(ComposerModel):
         if hasattr(cfg, 'n_heads'):
             self.config.num_attention_heads = cfg.n_heads
 
-        # === Heads ===
-        self.embedding_heads = BGEEmbeddingHeads(self.config)
+        # === Tokenizer (allow custom/pruned tokenizer) ===
+        # [VOCAB_SYNC] Luôn lấy tokenizer trước khi khởi tạo backbone để đồng bộ vocab
+        tok_name = getattr(cfg, 'tokenizer_name', model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(tok_name)
+        target_vocab_size = _safe_get_tokenizer_vocab_size(self.tokenizer)
+
+        # [VOCAB_SYNC] Đồng bộ vào config trước khi build backbone/heads
+        self.config.vocab_size = int(target_vocab_size)
 
         # === Device name normalization ===
         device_name = get_device(None).name
         if device_name == "gpu":
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # === Validate config ===
-        self._validate_config()
+        # === Backbone ===
+        self.backbone = MaskedBGEM3Backbone(self.config)
 
-        # === L0 module ===
+        # === Nạp state_dict base_model (lọc các key lệch shape an toàn)
+        base_sd = base_model.state_dict()
+        own_sd = self.backbone.state_dict()
+        # [VOCAB_SYNC] Bỏ qua các embedding không cùng shape (vì vocab đã đồng bộ theo tokenizer)
+        skip_prefixes = {
+            "embeddings.word_embeddings.weight",
+            "embeddings.position_embeddings.weight",
+            "embeddings.token_type_embeddings.weight",
+        }
+        for k in list(base_sd.keys()):
+            if k in skip_prefixes:
+                if k in own_sd and base_sd[k].shape != own_sd[k].shape:
+                    # skip embedding weight không khớp vocab
+                    del base_sd[k]
+            elif k in own_sd and base_sd[k].shape != own_sd[k].shape:
+                # Bất kỳ layer nào khác lệch shape (hiếm) -> skip
+                # (tránh crash do khác cấu hình n_heads/intermediate đã override)
+                del base_sd[k]
+
+        self.backbone.load_state_dict(base_sd, strict=False)
+
+        # === Heads ===
+        self.embedding_heads = BGEEmbeddingHeads(self.config)
+        # [VOCAB_SYNC] Đảm bảo heads biết vocab hiện tại
+        if hasattr(self.embedding_heads, "set_vocab_size"):
+            self.embedding_heads.set_vocab_size(self.config.vocab_size)
+        else:
+            # fallback nếu class cũ chưa có setter
+            self.embedding_heads.vocab_size = self.config.vocab_size
+
+        # === Loss/L0 flags ===
         self.l0_module = L0ModuleEmbedding(cfg, device_name, self.backbone)
-
-        # === Loss flags ===
         self.use_sts_loss = getattr(cfg, 'use_sts_loss', True)
         self.use_contrastive_loss = getattr(cfg, 'use_contrastive_loss', True)
         self.temperature = getattr(cfg, 'temperature', 0.02)
@@ -64,14 +115,71 @@ class ComposerBGEM3(ComposerModel):
         self.eval_metrics: Dict[str, Any] = {}
         self.ref_model = None
 
-        # === HF export options (NEW): allow wiring pruned tokenizer from cfg ===
-        # e.g., cfg.hf_export.pruned_vocab_repo = "minhchuxuan/bge_pruned_298"
-        #       cfg.hf_export.pruned_vocab_subfolder = "exp_high_hf"
+        # === HF export options ===
         self.hf_export_opts = {}
         if hasattr(cfg, "hf_export"):
-            # store but do not hard-depend on presence
             self.hf_export_opts["pruned_vocab_repo"] = getattr(cfg.hf_export, "pruned_vocab_repo", None)
             self.hf_export_opts["pruned_vocab_subfolder"] = getattr(cfg.hf_export, "pruned_vocab_subfolder", None)
+
+        # === Final config check ===
+        self._validate_config()
+
+    # -------------------- [VOCAB_SYNC] Helpers --------------------
+
+    def _resize_backbone_token_embeddings(self, new_size: int):
+        """
+        Resize word embeddings in-place to `new_size` (copy phần chung, init phần dư = mean vector).
+        Không phụ thuộc vào backbone triển khai riêng.
+        """
+        we: nn.Embedding = self.backbone.embeddings.word_embeddings
+        old_size, dim = we.weight.size()
+        if new_size == old_size:
+            return
+        device, dtype = we.weight.device, we.weight.dtype
+        padding_idx = getattr(we, "padding_idx", None)
+
+        new_we = nn.Embedding(new_size, dim, padding_idx=padding_idx, device=device, dtype=dtype)
+        n = min(old_size, new_size)
+        with torch.no_grad():
+            new_we.weight[:n].copy_(we.weight[:n])
+            if new_size > n:
+                fill = we.weight.mean(dim=0, keepdim=True).to(dtype)
+                new_we.weight[n:].copy_(fill)
+
+        self.backbone.embeddings.word_embeddings = new_we
+        # đồng bộ config
+        self.backbone.config.vocab_size = int(new_size)
+        self.config.vocab_size = int(new_size)
+
+    def sync_vocab_everywhere(
+        self,
+        tokenizer: Optional[Any] = None,
+        vocab_size: Optional[int] = None,
+        resize_backbone: bool = True,
+    ):
+        """
+        [VOCAB_SYNC] One-shot đồng bộ vocab cho config/backbone/heads.
+        - Nếu `vocab_size` None -> lấy từ `tokenizer` (hoặc self.tokenizer).
+        - Nếu `resize_backbone` True -> resize word embeddings để khớp.
+        """
+        if vocab_size is None:
+            if tokenizer is None:
+                tokenizer = getattr(self, "tokenizer", None)
+            if tokenizer is None:
+                raise ValueError("sync_vocab_everywhere: need tokenizer or vocab_size.")
+            vocab_size = _safe_get_tokenizer_vocab_size(tokenizer)
+
+        vocab_size = int(vocab_size)
+        if resize_backbone:
+            self._resize_backbone_token_embeddings(vocab_size)
+        else:
+            self.config.vocab_size = vocab_size
+            self.backbone.config.vocab_size = vocab_size
+
+        if hasattr(self.embedding_heads, "set_vocab_size"):
+            self.embedding_heads.set_vocab_size(vocab_size)
+        else:
+            self.embedding_heads.vocab_size = vocab_size
 
     # -------------------- Forward / Loss --------------------
 
@@ -264,6 +372,11 @@ class ComposerBGEM3(ComposerModel):
         self.prune_params(zs)
         self._validate_pruned_model()
 
+        # [VOCAB_SYNC] đảm bảo vocab hiện tại khớp tokenizer trước khi export
+        tok_name = tokenizer_name or getattr(self, 'base_model_name', 'BAAI/bge-m3')
+        tok = AutoTokenizer.from_pretrained(tok_name)
+        self.sync_vocab_everywhere(tokenizer=tok, resize_backbone=False)
+
         # 3) Export → HF
         print(f"\n💾 Saving pruned model to {save_path}")
         base_model_name = tokenizer_name or getattr(self, 'base_model_name', 'BAAI/bge-m3')
@@ -294,7 +407,8 @@ class ComposerBGEM3(ComposerModel):
                     self.backbone.encoder.layer[0].intermediate.dense.out_features
                     if len(self.backbone.encoder.layer) > 0 else 0
                 ),
-                'hidden_size': self.config.hidden_size
+                'hidden_size': self.config.hidden_size,
+                'vocab_size': self.config.vocab_size,
             },
             'tokenizer_remap': {
                 'repo': pruned_repo,
@@ -339,6 +453,10 @@ class ComposerBGEM3(ComposerModel):
         pruned_repo = pruned_vocab_repo or self.hf_export_opts.get("pruned_vocab_repo")
         pruned_sub = pruned_vocab_subfolder or self.hf_export_opts.get("pruned_vocab_subfolder")
 
+        # [VOCAB_SYNC] bảo đảm vocab đồng bộ trước khi export
+        tok = AutoTokenizer.from_pretrained(base_model_name)
+        self.sync_vocab_everywhere(tokenizer=tok, resize_backbone=False)
+
         print(f"\n💾 Exporting (no pruning) to {save_path}")
         save_backbone_as_hf_model(
             backbone=self.backbone,
@@ -379,5 +497,6 @@ class ComposerBGEM3(ComposerModel):
         print(
             f"✅ Model validation passed: {actual_layers} layers, "
             f"{backbone_config.num_attention_heads} heads, "
-            f"{backbone_config.intermediate_size} intermediate size"
+            f"{backbone_config.intermediate_size} intermediate size, "
+            f"{backbone_config.vocab_size} vocab"
         )
