@@ -114,6 +114,11 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"📈 Total parameters: {total_params:,}")
     print(f"📈 Trainable parameters: {trainable_params:,}")
+    print("tok len     :", len(model.tokenizer))
+    print("cfg vocab   :", model.config.vocab_size)
+    print("emb vocab   :", model.backbone.embeddings.word_embeddings.weight.shape[0])
+    print("emb dim     :", model.backbone.embeddings.word_embeddings.weight.shape[1])
+
     
     # Setup data with MTEB support
     print(f"📊 Loading {args.dataset} dataset from HuggingFace...")
