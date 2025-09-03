@@ -24,6 +24,8 @@ class MaskedXLMRobertaAttention(nn.Module):
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
+        self.out_proj = nn.Linear(self.all_head_size, self.hidden_size, bias=True)
+
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = position_embedding_type or getattr(
             config, "position_embedding_type", "absolute"
@@ -41,6 +43,8 @@ class MaskedXLMRobertaAttention(nn.Module):
         self.query = prune_linear_layer(self.query, index)
         self.key = prune_linear_layer(self.key, index)
         self.value = prune_linear_layer(self.value, index)
+
+        self.out_proj = prune_linear_layer(self.out_proj, index, dim=1)
 
         self.num_attention_heads = self.num_attention_heads - len(heads)
         self.all_head_size = self.attention_head_size * self.num_attention_heads
@@ -91,6 +95,8 @@ class MaskedXLMRobertaAttention(nn.Module):
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(new_context_layer_shape)
+
+        context_layer = self.out_proj(context_layer)
 
         outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
         return outputs
@@ -389,17 +395,17 @@ class MaskedBGEM3Backbone(nn.Module):
                     layer.attention.prune_heads(pruned_heads)
                     total_remaining_heads += layer.attention.num_attention_heads
             
-            # Update config ensuring mathematical consistency
-            if len(self.encoder.layer) > 0:
-                avg_heads = total_remaining_heads // len(self.encoder.layer)
-                # Ensure hidden_size is divisible by num_attention_heads
-                if self.config.hidden_size % avg_heads != 0:
-                    # Adjust to nearest valid head count that divides hidden_size
-                    for h in range(avg_heads, 0, -1):
-                        if self.config.hidden_size % h == 0:
-                            avg_heads = h
-                            break
-                self.config.num_attention_heads = avg_heads
+            # # Update config ensuring mathematical consistency
+            # if len(self.encoder.layer) > 0:
+            #     avg_heads = total_remaining_heads // len(self.encoder.layer)
+            #     # Ensure hidden_size is divisible by num_attention_heads
+            #     if self.config.hidden_size % avg_heads != 0:
+            #         # Adjust to nearest valid head count that divides hidden_size
+            #         for h in range(avg_heads, 0, -1):
+            #             if self.config.hidden_size % h == 0:
+            #                 avg_heads = h
+            #                 break
+            #     self.config.num_attention_heads = avg_heads
 
 
 
