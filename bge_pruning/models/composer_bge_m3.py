@@ -16,25 +16,20 @@ from .embedding_heads import BGEEmbeddingHeads
 from .bge_m3_backbone import MaskedBGEM3Backbone
 
 
-# =========================
-# [VOCAB_SYNC] Utilities
-# =========================
+# ===== Helpers: lấy kích thước vocab an toàn =====
 def _safe_get_tokenizer_vocab_size(tokenizer) -> int:
-    """Ưu tiên len(tokenizer) (bao gồm added tokens), fallback tokenizer.vocab_size."""
-    size_by_len = None
     try:
-        size_by_len = len(tokenizer)
+        n_len = len(tokenizer)
     except Exception:
-        pass
-    size_by_attr = getattr(tokenizer, "vocab_size", None)
-    candidates = [s for s in [size_by_len, size_by_attr] if isinstance(s, int) and s > 0]
-    if not candidates:
-        # fallback cuối cùng
-        get_vocab = getattr(tokenizer, "get_vocab", None)
-        if callable(get_vocab):
-            return len(get_vocab())
-        raise ValueError("Cannot determine tokenizer vocab size.")
-    return max(candidates)
+        n_len = None
+    n_attr = getattr(tokenizer, "vocab_size", None)
+    cands = [n for n in (n_len, n_attr) if isinstance(n, int) and n > 0]
+    if cands:
+        return max(cands)
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if callable(get_vocab):
+        return len(get_vocab())
+    raise ValueError("Cannot determine tokenizer vocab size.")
 
 
 class ComposerBGEM3(ComposerModel):
@@ -43,13 +38,13 @@ class ComposerBGEM3(ComposerModel):
     def __init__(self, cfg):
         super().__init__()
 
-        # === Base / config ===
+        # --- Load base model + config ---
         model_name = getattr(cfg, 'base_model', 'BAAI/bge-m3')
-        self.base_model_name = model_name  # keep for HF export
+        self.base_model_name = model_name
         base_model = AutoModel.from_pretrained(model_name)
         self.config = base_model.config
 
-        # === Optional overrides from cfg (keep consistent with math constraints) ===
+        # --- Optional overrides ---
         if hasattr(cfg, 'd_model'):
             self.config.hidden_size = cfg.d_model
         if hasattr(cfg, 'n_layers'):
@@ -57,134 +52,71 @@ class ComposerBGEM3(ComposerModel):
         if hasattr(cfg, 'n_heads'):
             self.config.num_attention_heads = cfg.n_heads
 
-        # === Tokenizer (allow custom/pruned tokenizer) ===
-        # [VOCAB_SYNC] Luôn lấy tokenizer trước khi khởi tạo backbone để đồng bộ vocab
+        # --- Tokenizer & sync vocab BEFORE building backbone ---
         tok_name = getattr(cfg, 'tokenizer_name', model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(tok_name)
-        target_vocab_size = _safe_get_tokenizer_vocab_size(self.tokenizer)
+        target_vocab = _safe_get_tokenizer_vocab_size(self.tokenizer)
+        self.config.vocab_size = int(target_vocab)
 
-        # [VOCAB_SYNC] Đồng bộ vào config trước khi build backbone/heads
-        self.config.vocab_size = int(target_vocab_size)
+        # --- Build backbone with synced vocab ---
+        self.backbone = MaskedBGEM3Backbone(self.config)
 
-        # === Device name normalization ===
+        # --- Load state dict safely: drop keys with mismatched shapes (e.g., embeddings) ---
+        base_sd = base_model.state_dict()
+        own_sd = self.backbone.state_dict()
+        for k in list(base_sd.keys()):
+            if k in own_sd and base_sd[k].shape != own_sd[k].shape:
+                # ví dụ: embeddings.word_embeddings.weight [8194, 1024] vs [512, 1024]
+                # strict=False KHÔNG bỏ qua mismatch shape, nên phải xóa key trước
+                del base_sd[k]
+        self.backbone.load_state_dict(base_sd, strict=False)
+
+        # --- Heads (sau khi vocab đã sync) ---
+        self.embedding_heads = BGEEmbeddingHeads(self.config)
+        # nếu head có setter thì dùng, không thì gán trực tiếp
+        if hasattr(self.embedding_heads, "set_vocab_size"):
+            self.embedding_heads.set_vocab_size(self.config.vocab_size)
+        else:
+            self.embedding_heads.vocab_size = self.config.vocab_size
+
+        # --- Device name normalization ---
         device_name = get_device(None).name
         if device_name == "gpu":
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # === Backbone ===
-        self.backbone = MaskedBGEM3Backbone(self.config)
+        # --- Validate config ---
+        self._validate_config()
 
-        # === Nạp state_dict base_model (lọc các key lệch shape an toàn)
-        base_sd = base_model.state_dict()
-        own_sd = self.backbone.state_dict()
-        # [VOCAB_SYNC] Bỏ qua các embedding không cùng shape (vì vocab đã đồng bộ theo tokenizer)
-        skip_prefixes = {
-            "embeddings.word_embeddings.weight",
-            "embeddings.position_embeddings.weight",
-            "embeddings.token_type_embeddings.weight",
-        }
-        for k in list(base_sd.keys()):
-            if k in skip_prefixes:
-                if k in own_sd and base_sd[k].shape != own_sd[k].shape:
-                    # skip embedding weight không khớp vocab
-                    del base_sd[k]
-            elif k in own_sd and base_sd[k].shape != own_sd[k].shape:
-                # Bất kỳ layer nào khác lệch shape (hiếm) -> skip
-                # (tránh crash do khác cấu hình n_heads/intermediate đã override)
-                del base_sd[k]
-
-        self.backbone.load_state_dict(base_sd, strict=False)
-
-        # === Heads ===
-        self.embedding_heads = BGEEmbeddingHeads(self.config)
-        # [VOCAB_SYNC] Đảm bảo heads biết vocab hiện tại
-        if hasattr(self.embedding_heads, "set_vocab_size"):
-            self.embedding_heads.set_vocab_size(self.config.vocab_size)
-        else:
-            # fallback nếu class cũ chưa có setter
-            self.embedding_heads.vocab_size = self.config.vocab_size
-
-        # === Loss/L0 flags ===
+        # --- L0 module ---
         self.l0_module = L0ModuleEmbedding(cfg, device_name, self.backbone)
+
+        # --- Loss flags ---
         self.use_sts_loss = getattr(cfg, 'use_sts_loss', True)
         self.use_contrastive_loss = getattr(cfg, 'use_contrastive_loss', True)
         self.temperature = getattr(cfg, 'temperature', 0.02)
 
-        # === Metrics ===
+        # --- Metrics ---
         self.train_metrics: Dict[str, Any] = {}
         self.eval_metrics: Dict[str, Any] = {}
         self.ref_model = None
 
-        # === HF export options ===
-        self.hf_export_opts = {}
-        if hasattr(cfg, "hf_export"):
-            self.hf_export_opts["pruned_vocab_repo"] = getattr(cfg.hf_export, "pruned_vocab_repo", None)
-            self.hf_export_opts["pruned_vocab_subfolder"] = getattr(cfg.hf_export, "pruned_vocab_subfolder", None)
-
-        # === Final config check ===
-        self._validate_config()
-
-    # -------------------- [VOCAB_SYNC] Helpers --------------------
-
-    def _resize_backbone_token_embeddings(self, new_size: int):
-        """
-        Resize word embeddings in-place to `new_size` (copy phần chung, init phần dư = mean vector).
-        Không phụ thuộc vào backbone triển khai riêng.
-        """
-        we: nn.Embedding = self.backbone.embeddings.word_embeddings
-        old_size, dim = we.weight.size()
-        if new_size == old_size:
-            return
-        device, dtype = we.weight.device, we.weight.dtype
-        padding_idx = getattr(we, "padding_idx", None)
-
-        new_we = nn.Embedding(new_size, dim, padding_idx=padding_idx, device=device, dtype=dtype)
-        n = min(old_size, new_size)
-        with torch.no_grad():
-            new_we.weight[:n].copy_(we.weight[:n])
-            if new_size > n:
-                fill = we.weight.mean(dim=0, keepdim=True).to(dtype)
-                new_we.weight[n:].copy_(fill)
-
-        self.backbone.embeddings.word_embeddings = new_we
-        # đồng bộ config
-        self.backbone.config.vocab_size = int(new_size)
-        self.config.vocab_size = int(new_size)
-
-    def sync_vocab_everywhere(
-        self,
-        tokenizer: Optional[Any] = None,
-        vocab_size: Optional[int] = None,
-        resize_backbone: bool = True,
-    ):
-        """
-        [VOCAB_SYNC] One-shot đồng bộ vocab cho config/backbone/heads.
-        - Nếu `vocab_size` None -> lấy từ `tokenizer` (hoặc self.tokenizer).
-        - Nếu `resize_backbone` True -> resize word embeddings để khớp.
-        """
+    # ===== Optional: đồng bộ vocab sau này nếu đổi tokenizer =====
+    def sync_vocab_everywhere(self, vocab_size: Optional[int] = None):
         if vocab_size is None:
-            if tokenizer is None:
-                tokenizer = getattr(self, "tokenizer", None)
-            if tokenizer is None:
-                raise ValueError("sync_vocab_everywhere: need tokenizer or vocab_size.")
-            vocab_size = _safe_get_tokenizer_vocab_size(tokenizer)
-
+            vocab_size = _safe_get_tokenizer_vocab_size(self.tokenizer)
         vocab_size = int(vocab_size)
-        if resize_backbone:
-            self._resize_backbone_token_embeddings(vocab_size)
-        else:
-            self.config.vocab_size = vocab_size
-            self.backbone.config.vocab_size = vocab_size
-
+        # cập nhật config
+        self.config.vocab_size = vocab_size
+        self.backbone.config.vocab_size = vocab_size
+        # cập nhật heads
         if hasattr(self.embedding_heads, "set_vocab_size"):
             self.embedding_heads.set_vocab_size(vocab_size)
         else:
             self.embedding_heads.vocab_size = vocab_size
+        # nếu muốn resize embedding vật lý, có thể thêm hàm resize trong backbone và gọi ở đây
 
     # -------------------- Forward / Loss --------------------
-
     def forward(self, batch):
-        """Forward pass through the model"""
         input_ids = batch['input_ids']
         attention_mask = batch.get('attention_mask', None)
 
@@ -219,29 +151,22 @@ class ComposerBGEM3(ComposerModel):
         }
 
     def eval_forward(self, batch, outputs=None):
-        """Evaluation forward pass"""
         return outputs if outputs is not None else self.forward(batch)
 
     def loss(self, outputs, batch):
-        """Production loss computation with proper tensor handling"""
         embeddings = outputs['embeddings']
         l0_output = outputs['l0_output']
-
-        # Interleaved pairs → batch_size
         batch_size = batch['input_ids'].size(0) // 2
 
         total_loss = 0.0
 
         if 'similarity_scores' in batch:
-            # STS
             sts_loss = self.compute_sts_loss(embeddings, batch, batch_size)
             total_loss += sts_loss
         else:
-            # Retrieval
             contrastive_loss = self.compute_contrastive_loss(embeddings, batch_size)
             total_loss += contrastive_loss
 
-        # L0 sparsity + constraint (scaled)
         if hasattr(self.l0_module, 'get_sparsity_loss'):
             sparsity_loss, expected_sparsity, expected_score = self.l0_module.get_sparsity_loss()
             constraint_loss = self.compute_constraint_loss(expected_sparsity)
@@ -253,30 +178,21 @@ class ComposerBGEM3(ComposerModel):
     def compute_sts_loss(self, embeddings: Dict[str, torch.Tensor], batch: Dict[str, Any], batch_size: int) -> torch.Tensor:
         dense_emb = embeddings['dense_embedding']  # [2B, D]
         similarity_scores = batch['similarity_scores']  # [B]
-
-        # pairwise split
         sent1_emb = dense_emb[0::2]
         sent2_emb = dense_emb[1::2]
-
-        # cosine -> [0,5]
         predicted_sim = F.cosine_similarity(sent1_emb, sent2_emb, dim=-1)
         predicted_sim = (predicted_sim + 1) * 2.5
-
-        sts_loss = F.mse_loss(predicted_sim, similarity_scores)
-        return sts_loss
+        return F.mse_loss(predicted_sim, similarity_scores)
 
     def compute_contrastive_loss(self, embeddings: Dict[str, torch.Tensor], batch_size: int) -> torch.Tensor:
-        dense_emb = embeddings['dense_embedding']  # [2B, D]
-
+        dense_emb = embeddings['dense_embedding']
         query_emb = dense_emb[0::2]
         passage_emb = dense_emb[1::2]
-
         sim = torch.matmul(query_emb, passage_emb.t()) / self.temperature
         labels = torch.arange(batch_size, device=query_emb.device)
         return F.cross_entropy(sim, labels)
 
     def compute_constraint_loss(self, expected_sparsity: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """LLM-Shearing style constraint loss with warmup and quadratic penalty"""
         constraint_loss = 0.0
         for mask_name, sparsity in expected_sparsity.items():
             if mask_name in self.l0_module.masks:
@@ -286,8 +202,6 @@ class ComposerBGEM3(ComposerModel):
                     diff = sparsity.mean() - current_target
                     constraint_loss += torch.abs(diff) + 5.0 * (diff ** 2)
         return constraint_loss
-
-    # -------------------- Pruning / info --------------------
 
     def get_metrics(self, is_train: bool = False) -> Dict[str, Any]:
         return self.train_metrics if is_train else self.eval_metrics
@@ -315,13 +229,11 @@ class ComposerBGEM3(ComposerModel):
         except ImportError:
             pred_centered = predicted_scores - predicted_scores.mean()
             gt_centered = ground_truth_scores - ground_truth_scores.mean()
-            correlation = (pred_centered * gt_centered).sum() / (
-                torch.sqrt((pred_centered ** 2).sum() * (gt_centered ** 2).sum()) + 1e-8
-            )
+            correlation = (pred_centered * gt_centered).sum() /
+            (torch.sqrt((pred_centered ** 2).sum() * (gt_centered ** 2).sum()) + 1e-8)
             return float(correlation)
 
     def extract_pruned_model(self) -> 'ComposerBGEM3':
-        """Skeleton for making a physically smaller model; depends on your pruning impl."""
         zs = self.l0_module()
         pruned_config = self._create_pruned_config(zs)
         pruned_model = ComposerBGEM3(pruned_config)
@@ -329,149 +241,56 @@ class ComposerBGEM3(ComposerModel):
         return pruned_model
 
     def _create_pruned_config(self, zs: Dict[str, torch.Tensor]) -> DictConfig:
-        # TODO: implement if you actually shrink hidden/intermediate/head dims
         pass
 
     def _copy_pruned_weights(self, target_model: 'ComposerBGEM3', zs: Dict[str, torch.Tensor]):
-        # TODO: implement copying only surviving slices if you physically shrink tensors
         pass
 
-    # -------------------- HF Export (UPDATED to support vocab remap) --------------------
-
-    def save_pruned_hf_model(
-        self,
-        save_path: str,
-        tokenizer_name: Optional[str] = None,
-        pruned_vocab_repo: Optional[str] = None,
-        pruned_vocab_subfolder: Optional[str] = None,
-    ):
-        """
-        Apply current L0 masks, physically prune backbone params (via .prune_params),
-        then export to 🤗 format. Supports pruned tokenizer remap.
-        """
+    def save_pruned_hf_model(self, save_path: str, tokenizer_name: str = None):
         import sys
         from pathlib import Path
-        project_root = Path(__file__).parent.parent
-        if str(project_root) not in sys.path:
-            sys.path.insert(0, str(project_root))
-
-        # Use the new hf_export that supports vocab remap
         from utils.hf_export import save_backbone_as_hf_model
 
         was_training = self.training
         self.eval()
 
-        # 1) Gather deterministic masks
         zs = self.l0_module()
         print("\n🎯 Applying pruning masks...")
         for mask_name, mask_tensor in zs.items():
             sparsity = (mask_tensor == 0).float().mean().item()
             print(f"  {mask_name}: {sparsity:.1%} sparsity")
 
-        # 2) Physically prune weights
         self.prune_params(zs)
         self._validate_pruned_model()
 
-        # [VOCAB_SYNC] đảm bảo vocab hiện tại khớp tokenizer trước khi export
-        tok_name = tokenizer_name or getattr(self, 'base_model_name', 'BAAI/bge-m3')
-        tok = AutoTokenizer.from_pretrained(tok_name)
-        self.sync_vocab_everywhere(tokenizer=tok, resize_backbone=False)
-
-        # 3) Export → HF
         print(f"\n💾 Saving pruned model to {save_path}")
         base_model_name = tokenizer_name or getattr(self, 'base_model_name', 'BAAI/bge-m3')
+        save_backbone_as_hf_model(self.backbone, save_path, base_model_name)
 
-        # Wire default pruned vocab from self.hf_export_opts if args not given
-        pruned_repo = pruned_vocab_repo or self.hf_export_opts.get("pruned_vocab_repo")
-        pruned_sub = pruned_vocab_subfolder or self.hf_export_opts.get("pruned_vocab_subfolder")
-
-        save_backbone_as_hf_model(
-            backbone=self.backbone,
-            save_path=save_path,
-            base_model_name=base_model_name,
-            pruned_vocab_repo=pruned_repo,
-            pruned_vocab_subfolder=pruned_sub,
-        )
-
-        # 4) Save pruning summary
         pruning_info = {
             'pruning_results': {name: float((mask == 0).float().mean()) for name, mask in zs.items()},
             'base_model': base_model_name,
             'final_config': {
                 'num_hidden_layers': len(self.backbone.encoder.layer),
-                'num_attention_heads': (
-                    self.backbone.encoder.layer[0].attention.num_attention_heads
-                    if len(self.backbone.encoder.layer) > 0 else 0
-                ),
-                'intermediate_size': (
-                    self.backbone.encoder.layer[0].intermediate.dense.out_features
-                    if len(self.backbone.encoder.layer) > 0 else 0
-                ),
+                'num_attention_heads': self.backbone.encoder.layer[0].attention.num_attention_heads
+                    if len(self.backbone.encoder.layer) > 0 else 0,
+                'intermediate_size': self.backbone.encoder.layer[0].intermediate.dense.out_features
+                    if len(self.backbone.encoder.layer) > 0 else 0,
                 'hidden_size': self.config.hidden_size,
                 'vocab_size': self.config.vocab_size,
-            },
-            'tokenizer_remap': {
-                'repo': pruned_repo,
-                'subfolder': pruned_sub,
             }
         }
         os.makedirs(save_path, exist_ok=True)
         with open(os.path.join(save_path, 'pruning_info.json'), 'w') as f:
             json.dump(pruning_info, f, indent=2)
 
-        print("✅ Pruned model saved in HuggingFace format!")
+        print(f"✅ Pruned model saved in HuggingFace format!")
         print(f"📁 Location: {save_path}")
         print(f"🔧 Usage: model = AutoModel.from_pretrained('{save_path}')")
 
         if was_training:
             self.train()
         return save_path
-
-    def export_without_pruning(
-        self,
-        save_path: str,
-        tokenizer_name: Optional[str] = None,
-        pruned_vocab_repo: Optional[str] = None,
-        pruned_vocab_subfolder: Optional[str] = None,
-    ):
-        """
-        NEW: Export current (unpruned) backbone to 🤗 format, optionally with vocab remap.
-        Useful for quick A/B eval before permanently pruning.
-        """
-        import sys
-        from pathlib import Path
-        project_root = Path(__file__).parent.parent
-        if str(project_root) not in sys.path:
-            sys.path.insert(0, str(project_root))
-
-        from utils.hf_export import save_backbone_as_hf_model
-
-        was_training = self.training
-        self.eval()
-
-        base_model_name = tokenizer_name or getattr(self, 'base_model_name', 'BAAI/bge-m3')
-        pruned_repo = pruned_vocab_repo or self.hf_export_opts.get("pruned_vocab_repo")
-        pruned_sub = pruned_vocab_subfolder or self.hf_export_opts.get("pruned_vocab_subfolder")
-
-        # [VOCAB_SYNC] bảo đảm vocab đồng bộ trước khi export
-        tok = AutoTokenizer.from_pretrained(base_model_name)
-        self.sync_vocab_everywhere(tokenizer=tok, resize_backbone=False)
-
-        print(f"\n💾 Exporting (no pruning) to {save_path}")
-        save_backbone_as_hf_model(
-            backbone=self.backbone,
-            save_path=save_path,
-            base_model_name=base_model_name,
-            pruned_vocab_repo=pruned_repo,
-            pruned_vocab_subfolder=pruned_sub,
-        )
-        print("✅ Export (no pruning) completed.")
-
-        if was_training:
-            self.train()
-        return save_path
-
-    # -------------------- Validation helpers --------------------
 
     def _validate_config(self):
         if self.config.hidden_size % self.config.num_attention_heads != 0:
