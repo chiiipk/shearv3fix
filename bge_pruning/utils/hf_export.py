@@ -151,7 +151,8 @@ def save_backbone_as_hf_model(
     save_path,
     base_model_name="BAAI/bge-m3",
     pruned_vocab_repo= None,          # e.g. "minhchuxuan/bge_pruned_298"
-    pruned_vocab_subfolder= None     # e.g. "exp_high_hf"
+    pruned_vocab_subfolder= None, # e.g. "exp_high_hf"
+    tokenizer_to_save=None,
 ):
     """
     Save (possibly pruned) backbone as a HuggingFace XLM-R model.
@@ -205,10 +206,15 @@ def save_backbone_as_hf_model(
 
     # 6) Save model and the right tokenizer
     hf_model.save_pretrained(save_path)
-    if pruned_vocab_repo is not None:
-        tok = AutoTokenizer.from_pretrained(pruned_vocab_repo, subfolder=pruned_vocab_subfolder)
+    if tokenizer_to_save is not None:
+        # ưu tiên lưu đúng tokenizer hiện tại (đã sync vocab)
+        tokenizer_to_save.save_pretrained(save_path)
     else:
-        tok = AutoTokenizer.from_pretrained(base_model_name)
-    tok.save_pretrained(save_path)
+        if pruned_vocab_repo is not None:
+            tok = AutoTokenizer.from_pretrained(pruned_vocab_repo, subfolder=pruned_vocab_subfolder)
+        else:
+            tok = AutoTokenizer.from_pretrained(base_model_name)
+        tok.save_pretrained(save_path)
+
 
     return save_path
