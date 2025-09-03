@@ -32,6 +32,7 @@ class MaskedXLMRobertaAttention(nn.Module):
         )
 
         self.pruned_heads = set()
+        self.register_buffer("keep_index", torch.empty(0, dtype=torch.long), persistent=True)
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -39,6 +40,7 @@ class MaskedXLMRobertaAttention(nn.Module):
         heads, index = find_pruneable_heads_and_indices(
             heads, self.num_attention_heads, self.attention_head_size, self.pruned_heads
         )
+        self.keep_index = index.detach().long().cpu()
 
         self.query = prune_linear_layer(self.query, index)
         self.key = prune_linear_layer(self.key, index)
