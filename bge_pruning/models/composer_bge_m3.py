@@ -186,3 +186,71 @@ class ComposerBGEM3(ComposerModel):
                 f"Hidden size ({self.config.hidden_size}) must be divisible by "
                 f"number of attention heads ({self.config.num_attention_heads})."
             )
+
+    def save_pruned_hf_model(
+        self,
+        save_path: str,
+        tokenizer_name: Optional[str] = None,
+        pruned_vocab_repo: Optional[str] = None,          # để None nếu KHÔNG remap
+        pruned_vocab_subfolder: Optional[str] = None,
+    ):
+        """
+        Áp dụng mask L0 → prune vật lý backbone → export sang HuggingFace.
+        Nếu không muốn prune tokenizer thì để pruned_vocab_repo=None.
+        """
+        import os, json
+        from utils.hf_export import save_backbone_as_hf_model
+
+        was_training = self.training
+        self.eval()
+
+        # 1) Lấy mask deterministic và prune backbone
+        zs = self.l0_module()
+        print("\n🎯 Applying pruning masks...")
+        for k, v in zs.items():
+            print(f"  {k}: {float((v == 0).float().mean()) :.1%} sparsity")
+        self.prune_params(zs)
+
+        # 2) Validate mô hình sau prune (nếu bạn đã có hàm này)
+        if hasattr(self, "_validate_pruned_model"):
+            self._validate_pruned_model()
+
+        # 3) Export HF (KHÔNG remap vocab nếu pruned_vocab_repo=None)
+        base_model_name = tokenizer_name or getattr(self, 'base_model_name', 'BAAI/bge-m3')
+        print(f"\n💾 Saving pruned model to {save_path}")
+        save_backbone_as_hf_model(
+            backbone=self.backbone,
+            save_path=save_path,
+            base_model_name=base_model_name,
+            pruned_vocab_repo=pruned_vocab_repo,              # None → không remap
+            pruned_vocab_subfolder=pruned_vocab_subfolder,
+            tokenizer_to_save=getattr(self, "tokenizer", None)  # lưu đúng tokenizer đang dùng
+        )
+
+        # 4) Ghi thông tin prune (tùy chọn)
+        info = {
+            'pruning_results': {name: float((mask == 0).float().mean()) for name, mask in zs.items()},
+            'base_model': base_model_name,
+            'final_config': {
+                'num_hidden_layers': len(self.backbone.encoder.layer),
+                'num_attention_heads': (
+                    self.backbone.encoder.layer[0].attention.num_attention_heads
+                    if len(self.backbone.encoder.layer) > 0 else 0
+                ),
+                'intermediate_size': (
+                    self.backbone.encoder.layer[0].intermediate.dense.out_features
+                    if len(self.backbone.encoder.layer) > 0 else 0
+                ),
+                'hidden_size': self.config.hidden_size,
+                'vocab_size': self.backbone.embeddings.word_embeddings.weight.shape[0],
+            }
+        }
+        os.makedirs(save_path, exist_ok=True)
+        with open(os.path.join(save_path, 'pruning_info.json'), 'w') as f:
+            json.dump(info, f, indent=2)
+
+        print("✅ Pruned model saved in HuggingFace format!")
+        if was_training:
+            self.train()
+        return save_path
+
