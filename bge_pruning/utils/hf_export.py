@@ -150,8 +150,8 @@ def save_backbone_as_hf_model(
     backbone,
     save_path,
     base_model_name="BAAI/bge-m3",
-    pruned_vocab_repo="minhchuxuan/bge_pruned_298",          # e.g. "minhchuxuan/bge_pruned_298"
-    pruned_vocab_subfolder="exp_high_hf"      # e.g. "exp_high_hf"
+    pruned_vocab_repo= None,          # e.g. "minhchuxuan/bge_pruned_298"
+    pruned_vocab_subfolder= None     # e.g. "exp_high_hf"
 ):
     """
     Save (possibly pruned) backbone as a HuggingFace XLM-R model.
