@@ -150,9 +150,9 @@ def save_backbone_as_hf_model(
     backbone,
     save_path,
     base_model_name="BAAI/bge-m3",
-    pruned_vocab_repo= None,          # e.g. "minhchuxuan/bge_pruned_298"
-    pruned_vocab_subfolder= None, # e.g. "exp_high_hf"
-    tokenizer_to_save=None,
+    pruned_vocab_repo=None,          # e.g. "minhchuxuan/bge_pruned_298"
+    pruned_vocab_subfolder=None,     # e.g. "exp_high_hf"
+    tokenizer_to_save=None,          # <— NEW
 ):
     """
     Save (possibly pruned) backbone as a HuggingFace XLM-R model.
@@ -160,61 +160,52 @@ def save_backbone_as_hf_model(
       1) build mapping new(pruned)->old(base) by token text,
       2) cut/reorder token-indexed tensors (embeddings, lm_head),
       3) set config.vocab_size = len(pruned tokenizer),
-      4) save pruned tokenizer alongside model.
+      4) save tokenizer (ưu tiên cái bạn truyền qua tokenizer_to_save).
     """
     Path(save_path).mkdir(parents=True, exist_ok=True)
 
     # 1) Build config from backbone, then override vocab_size if we will prune vocab.
     hf_config_dict = create_hf_config_from_backbone(backbone)
 
-    # Create config from base model then patch in real dims
     config = AutoConfig.from_pretrained(base_model_name)
-    for key, value in hf_config_dict.items():
-        setattr(config, key, value)
+    for k, v in hf_config_dict.items():
+        setattr(config, k, v)
 
     # 2) Prepare state dict (strip prefixes first)
-    backbone_state = backbone.state_dict()
-    backbone_state = _strip_prefixes(backbone_state)
+    backbone_state = _strip_prefixes(backbone.state_dict())
 
     # 3) Optional: shrink vocab to pruned tokenizer
-    idx = None
     if pruned_vocab_repo is not None:
         idx, new_vs = _build_pruned_mapping(
             pruned_repo=pruned_vocab_repo,
             pruned_subfolder=pruned_vocab_subfolder,
             base_repo=base_model_name
         )
-        # Try to guess hidden size for extra safety (not mandatory)
         hidden = backbone.embeddings.word_embeddings.weight.shape[1]
         backbone_state = _shrink_vocab_state_(backbone_state, idx, hidden_size_hint=hidden)
-        # make sure config matches pruned vocab
         config.vocab_size = new_vs
         print(f"[INFO] config.vocab_size set to pruned size = {new_vs}")
 
-    # 4) Create fresh HF model and load converted weights
+    # 4) Create HF model + load weights
     hf_model = AutoModel.from_config(config)
-
-    # Attention-key fix & any other minor renames
     hf_state_dict = convert_backbone_to_hf_state_dict(backbone_state)
+    missing, unexpected = hf_model.load_state_dict(hf_state_dict, strict=False)
+    if missing:
+        print(f"[WARN] {len(missing)} missing keys (ok for pruned models)")
+    if unexpected:
+        print(f"[WARN] {len(unexpected)} unexpected keys (ok for custom backbones)")
 
-    # 5) Load weights
-    missing_keys, unexpected_keys = hf_model.load_state_dict(hf_state_dict, strict=False)
-    if len(missing_keys) > 0:
-        print(f"[WARN] {len(missing_keys)} missing keys (may be normal for pruned model)")
-    if len(unexpected_keys) > 0:
-        print(f"[WARN] {len(unexpected_keys)} unexpected keys (may be normal for custom backbone)")
-
-    # 6) Save model and the right tokenizer
+    # 5) Save model + tokenizer
     hf_model.save_pretrained(save_path)
     if tokenizer_to_save is not None:
-        # ưu tiên lưu đúng tokenizer hiện tại (đã sync vocab)
+        # ưu tiên lưu đúng tokenizer bạn đang dùng (đã sync vocab)
         tokenizer_to_save.save_pretrained(save_path)
     else:
+        # nếu không truyền vào, chọn theo chế độ remap hay base
         if pruned_vocab_repo is not None:
             tok = AutoTokenizer.from_pretrained(pruned_vocab_repo, subfolder=pruned_vocab_subfolder)
         else:
             tok = AutoTokenizer.from_pretrained(base_model_name)
         tok.save_pretrained(save_path)
-
 
     return save_path
