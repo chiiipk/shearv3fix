@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 from transformers import AutoModel, AutoConfig, AutoTokenizer
+from typing import Optional, Any
+
 
 
 def get_layer_count_from_state_dict(state_dict):
