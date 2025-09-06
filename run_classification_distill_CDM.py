@@ -46,7 +46,8 @@ import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Tuple, List
-
+from peft import PeftModel
+import re
 import numpy as np
 import torch
 import torch.nn as nn
@@ -280,33 +281,39 @@ def main():
     student_config = AutoConfig.from_pretrained(model_args.model_name_or_path, output_hidden_states=True)
     student_model = AutoModel.from_pretrained(model_args.model_name_or_path, config=student_config)
     # Teacher
-    teacher_tokenizer = AutoTokenizer.from_pretrained(model_args.teacher_path, trust_remote_code=True)
-    teacher_config = AutoConfig.from_pretrained(model_args.teacher_path, trust_remote_code=True)
-    # When training with large teachers (e.g. 7B parameters) on multiple GPUs, we can
-    # automatically shard the model across available devices via ``device_map='auto'``.
-    # We also request half precision to reduce memory.  If only a single GPU is
-    # available, the model will reside entirely on that device.
-    device_map = None
-    if torch.cuda.device_count() > 1:
-        # Let transformers infer an automatic device map across GPUs
-        device_map = "auto"
+   
+    
+    teacher_path = model_args.teacher_path
+    
+    # Nếu repo có hậu tố '-supervised', tách phần gốc
+    m = re.match(r"(.+)-supervised$", teacher_path)
+    if m is not None:
+        base_model_name = m.group(1)
+    else:
+        base_model_name = teacher_path
+    
+    # Tải tokenizer và config từ model gốc
+    teacher_tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    teacher_config = AutoConfig.from_pretrained(base_model_name, trust_remote_code=True)
+    
+    # Nếu có 2 GPU, phân bố mô hình tự động; dùng float16 để giảm tiêu thụ VRAM
+    device_map = "auto" if torch.cuda.device_count() > 1 else None
     teacher_model = AutoModel.from_pretrained(
-        model_args.teacher_path,
+        base_model_name,
         config=teacher_config,
         trust_remote_code=True,
         device_map=device_map,
         torch_dtype=torch.float16 if torch.cuda.is_available() else None,
     )
-    # Do not call `.to(device)` when using device_map; the weights are already
-    # placed on the correct devices.  Set to evaluation mode.
+
+    # Nếu ban đầu có '-supervised', tải trọng số LoRA và gộp vào mô hình gốc
+    if m is not None:
+        teacher_model = PeftModel.from_pretrained(teacher_model, teacher_path)
+        teacher_model = teacher_model.merge_and_unload()
+    
     teacher_model.eval()
-    # Determine a device to host the teacher inputs.  When using model
-    # parallelism (device_map='auto'), inputs are typically placed on the
-    # first CUDA device.  If CUDA is unavailable, fall back to CPU.
-    if torch.cuda.is_available():
-        teacher_device = torch.device("cuda:0")
-    else:
-        teacher_device = torch.device("cpu")
+    teacher_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+
     # Preprocess dataset
     def preprocess_examples(examples):
         # Use "text" if present, otherwise try other common fields
